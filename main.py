@@ -163,16 +163,31 @@ async def webhook(job_id: str, request: Request):
     except Exception:
         payload = []
 
-    logger.info(f"[{job_id}] Webhook received with {len(payload) if isinstance(payload, list) else '?'} people.")
+    import json as _json
+    logger.info(f"[{job_id}] Webhook raw payload: {_json.dumps(payload)[:2000]}")
 
-    # The pipeline sets up a company-level event keyed by index.
-    # We store the payload and signal the waiting thread.
+    # Handle both raw array and wrapped object shapes
+    if isinstance(payload, list):
+        people = payload
+    elif isinstance(payload, dict):
+        # Try common wrapper keys ProntoHQ might use
+        people = (
+            payload.get("people")
+            or payload.get("leads")
+            or payload.get("results")
+            or payload.get("data")
+            or []
+        )
+    else:
+        people = []
+
+    logger.info(f"[{job_id}] Webhook received {len(people)} people.")
+
     with store_lock:
-        # Find the active event (the one that is not yet set)
         events: dict = job["events"]
         for idx, event in events.items():
             if not event.is_set():
-                job["webhook_data"][idx] = payload if isinstance(payload, list) else []
+                job["webhook_data"][idx] = people
                 event.set()
                 break
 
