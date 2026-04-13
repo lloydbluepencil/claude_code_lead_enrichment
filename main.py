@@ -164,31 +164,37 @@ async def webhook(job_id: str, request: Request):
         payload = []
 
     import json as _json
-    logger.info(f"[{job_id}] Webhook raw payload: {_json.dumps(payload)[:2000]}")
-
-    # Handle both raw array and wrapped object shapes
-    if isinstance(payload, list):
-        people = payload
-    elif isinstance(payload, dict):
-        # Try common wrapper keys ProntoHQ might use
-        people = (
-            payload.get("people")
-            or payload.get("leads")
-            or payload.get("results")
-            or payload.get("data")
-            or []
-        )
-    else:
-        people = []
-
-    logger.info(f"[{job_id}] Webhook received {len(people)} people.")
+    logger.info(f"[{job_id}] Webhook raw payload: {_json.dumps(payload)[:500]}")
 
     with store_lock:
         events: dict = job["events"]
-        for idx, event in events.items():
-            if not event.is_set():
-                job["webhook_data"][idx] = people
-                event.set()
-                break
+        active_idx = next((i for i, e in events.items() if not e.is_set()), None)
+
+        if active_idx is None:
+            return {"received": True}
+
+        # Streaming mode: ProntoHQ sends one person per call, then a final
+        # completion call with a "leads" key (leads: []) to signal done.
+        if isinstance(payload, dict) and "leads" in payload:
+            # Completion signal — fire the event with whatever we've accumulated
+            accumulated = job["webhook_data"].get(active_idx, [])
+            logger.info(f"[{job_id}] Stream complete — {len(accumulated)} people accumulated.")
+            events[active_idx].set()
+
+        elif isinstance(payload, dict) and ("first_name" in payload or "linkedin_profile_url" in payload):
+            # Individual streamed person — accumulate, don't fire event yet
+            if active_idx not in job["webhook_data"]:
+                job["webhook_data"][active_idx] = []
+            job["webhook_data"][active_idx].append(payload)
+            logger.info(f"[{job_id}] Streamed person #{len(job['webhook_data'][active_idx])}: {payload.get('full_name', '')}")
+
+        elif isinstance(payload, list):
+            # Non-streaming batch response (fallback)
+            job["webhook_data"][active_idx] = payload
+            logger.info(f"[{job_id}] Batch webhook: {len(payload)} people.")
+            events[active_idx].set()
+
+        else:
+            logger.warning(f"[{job_id}] Unrecognised webhook shape, ignoring.")
 
     return {"received": True}
