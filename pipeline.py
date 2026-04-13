@@ -35,6 +35,29 @@ COUNTRY_ABBREVIATIONS = {
     "AU": "Australia",
 }
 
+# City → Country fallback for common single-segment addresses
+CITY_TO_COUNTRY = {
+    "DUBAI": "United Arab Emirates",
+    "ABU DHABI": "United Arab Emirates",
+    "SHARJAH": "United Arab Emirates",
+    "RIYADH": "Saudi Arabia",
+    "JEDDAH": "Saudi Arabia",
+    "DOHA": "Qatar",
+    "KUWAIT CITY": "Kuwait",
+    "MANAMA": "Bahrain",
+    "MUSCAT": "Oman",
+    "CAIRO": "Egypt",
+    "LONDON": "United Kingdom",
+    "MANCHESTER": "United Kingdom",
+    "NEW YORK": "United States",
+    "LOS ANGELES": "United States",
+    "SINGAPORE": "Singapore",
+    "SYDNEY": "Australia",
+    "MELBOURNE": "Australia",
+    "TORONTO": "Canada",
+    "DUBAI CITY": "United Arab Emirates",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,11 +107,16 @@ def resolve_seniority_ids(seniority_levels: list) -> list:
 
 
 def parse_country(address: str) -> str:
-    """Extract country from the last comma-separated segment, expanding abbreviations."""
+    """Extract country from address, expanding abbreviations and known cities."""
     if not address:
         return ""
     raw = address.split(",")[-1].strip()
-    return COUNTRY_ABBREVIATIONS.get(raw.upper(), raw)
+    upper = raw.upper()
+    if upper in COUNTRY_ABBREVIATIONS:
+        return COUNTRY_ABBREVIATIONS[upper]
+    if upper in CITY_TO_COUNTRY:
+        return CITY_TO_COUNTRY[upper]
+    return raw
 
 
 # ---------------------------------------------------------------------------
