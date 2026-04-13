@@ -185,7 +185,7 @@ def step2_find_people(
     webhook_url = f"{base_url}/webhook/{job_id}"
     company_name = company.get("company_name", "Unknown")
 
-    seniority_ids = resolve_seniority_ids(filters.get("seniority_levels") or [])
+    seniority = filters.get("seniority_levels") or []
 
     body = {
         "name": company.get("company_name", ""),
@@ -193,8 +193,9 @@ def step2_find_people(
         "included_locations": [location_id],
         "job_titles": filters.get("job_titles", []),
         "excluded_job_titles": filters.get("excluded_job_titles", []),
-        "seniority_levels": seniority_ids,
+        "custom": {"seniority": seniority},
         "webhook_url": webhook_url,
+        "streaming": True,
         "limit": filters.get("limit", 25),
     }
 
@@ -216,10 +217,10 @@ def step2_find_people(
     with lock:
         event: threading.Event = job_store[job_id]["events"][company_index]
 
-    fired = event.wait(timeout=120)
+    fired = event.wait(timeout=300)
 
     if not fired:
-        logger.warning(f"[{job_id}] {company_name} — webhook timeout after 120s (search_timeout)")
+        logger.warning(f"[{job_id}] {company_name} — webhook timeout after 300s (search_timeout)")
         return None
 
     with lock:
