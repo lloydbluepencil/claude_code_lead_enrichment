@@ -3,9 +3,10 @@ import threading
 import logging
 import csv
 import io
+import json as _json
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ from models import (
     Progress,
     Contact,
 )
-from pipeline import run_pipeline
+from pipeline import run_pipeline, step3_enrich_person
 
 load_dotenv()
 
@@ -35,7 +36,7 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# In-memory job store  { job_id: { status, progress, results, events, lock } }
+# In-memory job store
 # ---------------------------------------------------------------------------
 job_store: dict[str, Any] = {}
 store_lock = threading.Lock()
@@ -51,9 +52,62 @@ def _make_job(total_companies: int) -> dict:
             "emails_enriched": 0,
         },
         "results": [],
-        "events": {},      # company_index -> threading.Event
-        "webhook_data": {},  # company_index -> list[people]
+        "events": {},           # company_index -> threading.Event
+        "webhook_data": {},     # company_index -> list (unused in streaming, kept for batch)
+        "source_companies": {}, # company_index -> company dict
+        "timers": {},           # company_index -> threading.Timer (idle timeout)
     }
+
+
+# ---------------------------------------------------------------------------
+# Webhook helpers
+# ---------------------------------------------------------------------------
+
+def _fire_event(job_id: str, active_idx: int, reason: str):
+    """Set the event for a company and cancel any pending idle timer."""
+    with store_lock:
+        job = job_store.get(job_id)
+        if not job:
+            return
+        timer = job["timers"].pop(active_idx, None)
+        if timer:
+            timer.cancel()
+        event = job["events"].get(active_idx)
+        if event and not event.is_set():
+            logger.info(f"[{job_id}] Company {active_idx} done ({reason})")
+            event.set()
+
+
+def _reset_idle_timer(job_id: str, active_idx: int, idle_seconds: int = 60):
+    """Restart the idle timer — fires if no new person arrives within idle_seconds."""
+    def on_idle():
+        logger.info(f"[{job_id}] Idle {idle_seconds}s exceeded for company {active_idx} — closing stream")
+        _fire_event(job_id, active_idx, "idle_timeout")
+
+    with store_lock:
+        job = job_store.get(job_id)
+        if not job:
+            return
+        old = job["timers"].pop(active_idx, None)
+        if old:
+            old.cancel()
+        t = threading.Timer(idle_seconds, on_idle)
+        t.daemon = True
+        t.start()
+        job["timers"][active_idx] = t
+
+
+def _enrich_in_background(job_id: str, person: dict, source_company: dict):
+    """Enrich a single person and append the result to job results immediately."""
+    try:
+        contact = step3_enrich_person(job_id, person, source_company)
+        if contact:
+            with store_lock:
+                job_store[job_id]["results"].append(contact)
+                if contact.get("most_probable_email"):
+                    job_store[job_id]["progress"]["emails_enriched"] += 1
+    except Exception as exc:
+        logger.error(f"[{job_id}] Background enrich error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +126,6 @@ def start_enrich(body: EnrichRequest):
     with store_lock:
         job_store[job_id] = _make_job(total)
 
-    # Serialize to plain dicts so the thread doesn't hold Pydantic model refs
     request_data = {
         "companies": [c.model_dump() for c in body.companies],
         "filters": body.filters.model_dump(),
@@ -116,8 +169,7 @@ CSV_FIELDS = [
 
 
 # ---------------------------------------------------------------------------
-# GET /enrich/{job_id}/results        → JSON (default)
-# GET /enrich/{job_id}/results?format=csv  → CSV download
+# GET /enrich/{job_id}/results  (json default, ?format=csv for download)
 # ---------------------------------------------------------------------------
 @app.get("/enrich/{job_id}/results")
 def get_results(job_id: str, format: str = "json"):
@@ -127,12 +179,13 @@ def get_results(job_id: str, format: str = "json"):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job["status"] != "complete":
-        return {"status": job["status"]}
-
+    # Return partial results while still processing
     results = job["results"]
+    status = job["status"]
 
     if format.lower() == "csv":
+        if not results:
+            raise HTTPException(status_code=404, detail="No results yet")
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
@@ -143,6 +196,9 @@ def get_results(job_id: str, format: str = "json"):
             media_type="text/csv",
             headers={"Content-Disposition": f"attachment; filename=enrichment_{job_id}.csv"},
         )
+
+    if status != "complete" and not results:
+        return {"status": status}
 
     return results
 
@@ -161,40 +217,53 @@ async def webhook(job_id: str, request: Request):
     try:
         payload = await request.json()
     except Exception:
-        payload = []
+        payload = {}
 
-    import json as _json
-    logger.info(f"[{job_id}] Webhook raw payload: {_json.dumps(payload)[:500]}")
+    logger.info(f"[{job_id}] Webhook: {_json.dumps(payload)[:500]}")
 
+    # Find the active (unset) event
     with store_lock:
-        events: dict = job["events"]
-        active_idx = next((i for i, e in events.items() if not e.is_set()), None)
+        active_idx = next((i for i, e in job["events"].items() if not e.is_set()), None)
 
-        if active_idx is None:
-            return {"received": True}
+    if active_idx is None:
+        return {"received": True}
 
-        # Streaming mode: ProntoHQ sends one person per call, then a final
-        # completion call with a "leads" key (leads: []) to signal done.
-        if isinstance(payload, dict) and "leads" in payload:
-            # Completion signal — fire the event with whatever we've accumulated
-            accumulated = job["webhook_data"].get(active_idx, [])
-            logger.info(f"[{job_id}] Stream complete — {len(accumulated)} people accumulated.")
-            events[active_idx].set()
+    if isinstance(payload, dict) and ("first_name" in payload or "linkedin_profile_url" in payload):
+        # --- Streaming: individual person ---
+        with store_lock:
+            job["progress"]["people_found"] += 1
+            source_company = job["source_companies"].get(active_idx, {})
 
-        elif isinstance(payload, dict) and ("first_name" in payload or "linkedin_profile_url" in payload):
-            # Individual streamed person — accumulate, don't fire event yet
-            if active_idx not in job["webhook_data"]:
-                job["webhook_data"][active_idx] = []
-            job["webhook_data"][active_idx].append(payload)
-            logger.info(f"[{job_id}] Streamed person #{len(job['webhook_data'][active_idx])}: {payload.get('full_name', '')}")
+        logger.info(f"[{job_id}] Streamed person: {payload.get('full_name', '')} — enriching in background")
 
-        elif isinstance(payload, list):
-            # Non-streaming batch response (fallback)
-            job["webhook_data"][active_idx] = payload
-            logger.info(f"[{job_id}] Batch webhook: {len(payload)} people.")
-            events[active_idx].set()
+        _reset_idle_timer(job_id, active_idx)
 
-        else:
-            logger.warning(f"[{job_id}] Unrecognised webhook shape, ignoring.")
+        threading.Thread(
+            target=_enrich_in_background,
+            args=(job_id, payload, source_company),
+            daemon=True,
+        ).start()
+
+    elif isinstance(payload, dict) and "leads" in payload:
+        # --- Completion signal from ProntoHQ ---
+        _fire_event(job_id, active_idx, "completion_signal")
+
+    elif isinstance(payload, list):
+        # --- Batch (non-streaming fallback) ---
+        with store_lock:
+            source_company = job["source_companies"].get(active_idx, {})
+            job["progress"]["people_found"] += len(payload)
+
+        for person in payload:
+            threading.Thread(
+                target=_enrich_in_background,
+                args=(job_id, person, source_company),
+                daemon=True,
+            ).start()
+
+        _fire_event(job_id, active_idx, "batch_complete")
+
+    else:
+        logger.warning(f"[{job_id}] Unrecognised webhook shape — ignoring")
 
     return {"received": True}

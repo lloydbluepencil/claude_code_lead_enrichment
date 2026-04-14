@@ -262,12 +262,6 @@ def step3_enrich_person(job_id: str, person: dict, source_company: dict) -> Opti
         logger.error(f"[{job_id}] single_enrich error {resp.status_code}: {resp.text}")
         return None
 
-    import json as _json
-    print(f"\n{'='*60}")
-    print(f"[STEP 3 RAW ENRICH RESPONSE] {first_name} {last_name}")
-    print(_json.dumps(resp.json(), indent=2))
-    print(f"{'='*60}\n")
-
     try:
         data = resp.json()
     except Exception:
@@ -345,9 +339,10 @@ def _process_company(
     company_name = company.get("company_name", "Unknown")
     logger.info(f"[{job_id}] Processing company: {company_name}")
 
-    # Register event for this company index upfront
+    # Register event and store source company for webhook to use
     with lock:
         job_store[job_id]["events"][company_index] = threading.Event()
+        job_store[job_id]["source_companies"][company_index] = company
 
     # STEP 1 — resolve location
     address = company.get("address", "")
@@ -372,29 +367,10 @@ def _process_company(
         lock=lock,
     )
 
+    # Step 3 is handled in real-time by the webhook handler.
+    # Pipeline just waits for the event, then moves to the next company.
     if people is None:
-        # Timeout or API error — already logged inside step2
-        with lock:
-            job_store[job_id]["progress"]["companies_processed"] += 1
-        return
-
-    logger.info(f"[{job_id}] {company_name} → {len(people)} people received from webhook")
-
-    with lock:
-        job_store[job_id]["progress"]["people_found"] += len(people)
-
-    # STEP 3 — enrich each person
-    for person in people:
-        try:
-            contact = step3_enrich_person(job_id, person, company)
-            if contact:
-                with lock:
-                    job_store[job_id]["results"].append(contact)
-                    job_store[job_id]["progress"]["emails_enriched"] += (
-                        1 if contact.get("most_probable_email") else 0
-                    )
-        except Exception as exc:
-            logger.error(f"[{job_id}] Enrich error for {person.get('first_name')} {person.get('last_name')}: {exc}")
+        logger.warning(f"[{job_id}] {company_name} — no webhook received (timeout or error)")
 
     with lock:
         job_store[job_id]["progress"]["companies_processed"] += 1
