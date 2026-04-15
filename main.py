@@ -357,7 +357,11 @@ def get_research_status(job_id: str):
 # ---------------------------------------------------------------------------
 # GET /research/{job_id}/results  (?format=csv for download)
 # ---------------------------------------------------------------------------
-RESEARCH_CSV_FIELDS = ["company_name", "domain"] + ALL_SIGNAL_KEYS
+_SIGNAL_PAIRS = [f for s in ALL_SIGNAL_KEYS for f in (s, f"{s}_reasoning")]
+RESEARCH_CSV_FIELDS = (
+    ["date_today", "date_90_days_ago", "company_name", "domain", "company_linkedin_url"]
+    + _SIGNAL_PAIRS
+)
 
 
 @app.get("/research/{job_id}/results")

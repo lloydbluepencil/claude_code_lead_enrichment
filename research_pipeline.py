@@ -7,6 +7,7 @@ Runs 7 configurable signals per company and returns Yes/No for each.
 import os
 import re
 import time
+import random
 import threading
 import logging
 from datetime import datetime, timedelta
@@ -17,6 +18,12 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 
 SUPPORTED_PROVIDERS = ("claude", "openai")
+
+# Max concurrent LLM calls across all jobs (prevents burst when multiple users run simultaneously)
+_LLM_SEMAPHORE = threading.Semaphore(2)
+
+# Base delay between signals (seconds). Tune per API tier.
+_BASE_SIGNAL_DELAY = 30.0
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -127,16 +134,21 @@ What does NOT qualify: remote hiring with no new location; "we serve customers i
 # Claude web search call
 # ---------------------------------------------------------------------------
 
-def _parse_yes_no(text: str, provider: str) -> str:
-    """Extract the last standalone Yes/No from a model response."""
+def _parse_yes_no(text: str, provider: str) -> tuple[str, str]:
+    """
+    Extract the last standalone Yes/No from a model response.
+    Returns (answer, reasoning) where reasoning is the full response text.
+    """
     text = text.strip()
     logger.info(f"[{provider}] raw response: {text[:300]}")
+    reasoning = text  # preserve full text for hover display
     if not text:
-        return "Unknown"
+        return "Unknown", ""
     matches = re.findall(r'\b(yes|no)\b', text, re.IGNORECASE)
     if matches:
-        return "Yes" if matches[-1].lower() == "yes" else "No"
-    return "Unknown"
+        answer = "Yes" if matches[-1].lower() == "yes" else "No"
+        return answer, reasoning
+    return "Unknown", reasoning
 
 
 def _call_claude(prompt: str) -> str:
@@ -165,7 +177,7 @@ def _call_claude(prompt: str) -> str:
     return _parse_yes_no(full_text, "claude")
 
 
-def _call_openai(prompt: str) -> str:
+def _call_openai(prompt: str) -> tuple[str, str]:
     """Call GPT-4o with built-in web search via the Responses API."""
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
@@ -182,11 +194,33 @@ def _call_openai(prompt: str) -> str:
     return _parse_yes_no(text, "openai")
 
 
-def _call_model(prompt: str, provider: str) -> str:
-    """Route to the selected LLM provider."""
-    if provider == "openai":
-        return _call_openai(prompt)
-    return _call_claude(prompt)  # default
+def _call_model(prompt: str, provider: str) -> tuple[str, str]:
+    """
+    Route to the selected LLM provider.
+    Wraps the call with exponential backoff + jitter on 429 errors.
+    Returns (answer, reasoning).
+    """
+    max_retries = 4
+    delay = _BASE_SIGNAL_DELAY
+
+    with _LLM_SEMAPHORE:
+        for attempt in range(max_retries):
+            try:
+                if provider == "openai":
+                    return _call_openai(prompt)
+                return _call_claude(prompt)
+            except Exception as exc:
+                is_rate_limit = "429" in str(exc) or "rate_limit" in str(exc).lower()
+                if is_rate_limit and attempt < max_retries - 1:
+                    jitter = random.uniform(0, delay * 0.25)
+                    wait   = delay + jitter
+                    logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                    delay *= 2  # exponential backoff
+                else:
+                    raise
+
+    return "Unknown", ""
 
 
 # ---------------------------------------------------------------------------
@@ -210,23 +244,32 @@ def _research_company(
         else domain or f"https://www.google.com/search?q={company_name}"
     )
 
-    result: dict = {"company_name": company_name, "domain": domain}
+    result: dict = {
+        "company_name":       company_name,
+        "domain":             domain,
+        "company_linkedin_url": linkedin_url,
+        "date_today":         _today(),
+        "date_90_days_ago":   _cutoff(),
+    }
 
     for signal in signals:
         logger.info(f"[{job_id}] {company_name} — [{provider}] researching: {signal}")
         try:
             prompt = _build_prompt(signal, company_name, website, linkedin_url)
-            answer = _call_model(prompt, provider)
-            result[signal] = answer
+            answer, reasoning = _call_model(prompt, provider)
+            result[signal]                    = answer
+            result[f"{signal}_reasoning"]     = reasoning
             logger.info(f"[{job_id}] {company_name} — {signal}: {answer}")
         except Exception as exc:
             logger.error(f"[{job_id}] {company_name} — {signal} error: {exc}")
-            result[signal] = "Error"
+            result[signal]                = "Error"
+            result[f"{signal}_reasoning"] = str(exc)
 
         with lock:
             job_store[job_id]["progress"]["signals_completed"] += 1
 
-        time.sleep(30)  # 30K TPM limit — each call consumes ~5–10K tokens with web search
+        # Base delay + small jitter to smooth out token consumption
+        time.sleep(_BASE_SIGNAL_DELAY + random.uniform(0, 5))
 
     return result
 
