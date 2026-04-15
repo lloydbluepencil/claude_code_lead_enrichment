@@ -136,7 +136,7 @@ def _call_claude(prompt: str) -> str:
         tools=[{
             "type": "web_search_20250305",
             "name": "web_search",
-            "max_uses": 5,
+            "max_uses": 3,
         }],
         messages=[{"role": "user", "content": prompt}],
     )
@@ -199,7 +199,7 @@ def _research_company(
         with lock:
             job_store[job_id]["progress"]["signals_completed"] += 1
 
-        time.sleep(0.5)  # avoid hitting rate limits between signals
+        time.sleep(20)  # 30K TPM limit — each call consumes ~5–10K tokens with web search
 
     return result
 
