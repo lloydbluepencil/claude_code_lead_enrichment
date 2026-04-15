@@ -1,17 +1,22 @@
 """
-research_pipeline.py — Company signal research pipeline using Claude + web search.
+research_pipeline.py — Company signal research pipeline.
+Supports Claude (Anthropic) and GPT-4o (OpenAI) as LLM providers.
 Runs 7 configurable signals per company and returns Yes/No for each.
 """
 
 import os
+import re
 import time
 import threading
 import logging
 from datetime import datetime, timedelta
 
 import anthropic
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+SUPPORTED_PROVIDERS = ("claude", "openai")
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -122,14 +127,25 @@ What does NOT qualify: remote hiring with no new location; "we serve customers i
 # Claude web search call
 # ---------------------------------------------------------------------------
 
+def _parse_yes_no(text: str, provider: str) -> str:
+    """Extract the last standalone Yes/No from a model response."""
+    text = text.strip()
+    logger.info(f"[{provider}] raw response: {text[:300]}")
+    if not text:
+        return "Unknown"
+    matches = re.findall(r'\b(yes|no)\b', text, re.IGNORECASE)
+    if matches:
+        return "Yes" if matches[-1].lower() == "yes" else "No"
+    return "Unknown"
+
+
 def _call_claude(prompt: str) -> str:
-    """Call Claude with web search. Returns 'Yes', 'No', or 'Error'."""
+    """Call Claude Sonnet with built-in web search."""
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
 
     client = anthropic.Anthropic(api_key=api_key)
-
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=512,
@@ -141,26 +157,36 @@ def _call_claude(prompt: str) -> str:
         messages=[{"role": "user", "content": prompt}],
     )
 
-    # Collect all text blocks and log for debugging
-    full_text = ""
-    for block in response.content:
-        if hasattr(block, "text") and block.text.strip():
-            full_text += block.text.strip() + " "
+    full_text = " ".join(
+        block.text.strip()
+        for block in response.content
+        if hasattr(block, "text") and block.text.strip()
+    )
+    return _parse_yes_no(full_text, "claude")
 
-    full_text = full_text.strip()
-    logger.info(f"Claude raw response: {full_text[:300]}")
 
-    if not full_text:
-        return "Unknown"
+def _call_openai(prompt: str) -> str:
+    """Call GPT-4o with built-in web search via the Responses API."""
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
 
-    # Use the LAST standalone Yes/No in the response — the model often
-    # explains reasoning first and gives the final answer at the end.
-    import re
-    matches = re.findall(r'\b(yes|no)\b', full_text, re.IGNORECASE)
-    if matches:
-        return "Yes" if matches[-1].lower() == "yes" else "No"
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model="gpt-4o",
+        tools=[{"type": "web_search_preview"}],
+        input=prompt,
+    )
 
-    return "Unknown"
+    text = response.output_text or ""
+    return _parse_yes_no(text, "openai")
+
+
+def _call_model(prompt: str, provider: str) -> str:
+    """Route to the selected LLM provider."""
+    if provider == "openai":
+        return _call_openai(prompt)
+    return _call_claude(prompt)  # default
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +197,7 @@ def _research_company(
     job_id: str,
     company: dict,
     signals: list,
+    provider: str,
     job_store: dict,
     lock: threading.Lock,
 ) -> dict:
@@ -186,10 +213,10 @@ def _research_company(
     result: dict = {"company_name": company_name, "domain": domain}
 
     for signal in signals:
-        logger.info(f"[{job_id}] {company_name} — researching signal: {signal}")
+        logger.info(f"[{job_id}] {company_name} — [{provider}] researching: {signal}")
         try:
             prompt = _build_prompt(signal, company_name, website, linkedin_url)
-            answer = _call_claude(prompt)
+            answer = _call_model(prompt, provider)
             result[signal] = answer
             logger.info(f"[{job_id}] {company_name} — {signal}: {answer}")
         except Exception as exc:
@@ -199,7 +226,7 @@ def _research_company(
         with lock:
             job_store[job_id]["progress"]["signals_completed"] += 1
 
-        time.sleep(20)  # 30K TPM limit — each call consumes ~5–10K tokens with web search
+        time.sleep(30)  # 30K TPM limit — each call consumes ~5–10K tokens with web search
 
     return result
 
@@ -213,10 +240,11 @@ def run_research_pipeline(
     """Background thread — researches each company for all selected signals."""
     companies = request_data["companies"]
     signals   = request_data["signals"]
+    provider  = request_data.get("provider", "claude")
 
     for company in companies:
         try:
-            result = _research_company(job_id, company, signals, job_store, lock)
+            result = _research_company(job_id, company, signals, provider, job_store, lock)
             with lock:
                 job_store[job_id]["results"].append(result)
                 job_store[job_id]["progress"]["companies_processed"] += 1

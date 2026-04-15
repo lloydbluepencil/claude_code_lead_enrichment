@@ -315,9 +315,12 @@ def start_research(body: ResearchRequest):
     with store_lock:
         job_store[job_id] = _make_research_job(total, signals)
 
+    provider = body.provider if body.provider in ("claude", "openai") else "claude"
+
     request_data = {
         "companies": [c.model_dump() for c in body.companies],
         "signals": signals,
+        "provider": provider,
     }
 
     threading.Thread(
@@ -326,7 +329,7 @@ def start_research(body: ResearchRequest):
         daemon=True,
     ).start()
 
-    logger.info(f"Research job {job_id} started — {total} companies, {len(signals)} signals each.")
+    logger.info(f"Research job {job_id} started — {total} companies, {len(signals)} signals, provider={provider}.")
     return ResearchStartResponse(
         job_id=job_id, status="processing",
         total_companies=total, signals=signals,

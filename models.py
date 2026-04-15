@@ -74,6 +74,7 @@ class ResearchCompany(BaseModel):
 class ResearchRequest(BaseModel):
     companies: List[ResearchCompany]
     signals: Optional[List[str]] = None   # None = run all signals
+    provider: Optional[str] = "claude"    # "claude" or "openai"
 
 
 class ResearchStartResponse(BaseModel):
