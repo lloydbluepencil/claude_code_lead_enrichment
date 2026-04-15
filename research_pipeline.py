@@ -132,7 +132,7 @@ def _call_claude(prompt: str) -> str:
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=100,
+        max_tokens=512,
         tools=[{
             "type": "web_search_20250305",
             "name": "web_search",
@@ -141,19 +141,24 @@ def _call_claude(prompt: str) -> str:
         messages=[{"role": "user", "content": prompt}],
     )
 
+    # Collect all text blocks and log for debugging
+    full_text = ""
     for block in response.content:
         if hasattr(block, "text") and block.text.strip():
-            text = block.text.strip()
-            lower = text.lower()
-            if lower.startswith("yes"):
-                return "Yes"
-            if lower.startswith("no"):
-                return "No"
-            # Fallback: scan first 20 chars
-            if "yes" in lower[:20]:
-                return "Yes"
-            if "no" in lower[:20]:
-                return "No"
+            full_text += block.text.strip() + " "
+
+    full_text = full_text.strip()
+    logger.info(f"Claude raw response: {full_text[:300]}")
+
+    if not full_text:
+        return "Unknown"
+
+    # Use the LAST standalone Yes/No in the response — the model often
+    # explains reasoning first and gives the final answer at the end.
+    import re
+    matches = re.findall(r'\b(yes|no)\b', full_text, re.IGNORECASE)
+    if matches:
+        return "Yes" if matches[-1].lower() == "yes" else "No"
 
     return "Unknown"
 
