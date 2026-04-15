@@ -4,9 +4,10 @@ import logging
 import csv
 import io
 import json as _json
+from datetime import datetime
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
@@ -279,10 +280,14 @@ async def webhook(job_id: str, request: Request):
 # RESEARCH PIPELINE endpoints  /research/*
 # ===========================================================================
 
-def _make_research_job(total_companies: int, signals: list) -> dict:
+def _make_research_job(total_companies: int, signals: list, provider: str = "openai", run_via: str = "webapp") -> dict:
     return {
         "type": "research",
         "status": "processing",
+        "provider": provider,
+        "run_via": run_via,
+        "started_at": datetime.now(),
+        "token_usage": {"input_tokens": 0, "output_tokens": 0},
         "progress": {
             "companies_processed": 0,
             "companies_total": total_companies,
@@ -309,13 +314,12 @@ def start_research(body: ResearchRequest):
             detail=f"Unknown signal(s): {invalid}. Valid: {ALL_SIGNAL_KEYS}",
         )
 
-    job_id = str(uuid.uuid4())
-    total  = len(body.companies)
+    job_id   = str(uuid.uuid4())
+    total    = len(body.companies)
+    provider = body.provider if body.provider in ("claude", "openai") else "openai"
 
     with store_lock:
-        job_store[job_id] = _make_research_job(total, signals)
-
-    provider = body.provider if body.provider in ("claude", "openai") else "claude"
+        job_store[job_id] = _make_research_job(total, signals, provider=provider, run_via="webapp")
 
     request_data = {
         "companies": [c.model_dump() for c in body.companies],
@@ -333,6 +337,81 @@ def start_research(body: ResearchRequest):
     return ResearchStartResponse(
         job_id=job_id, status="processing",
         total_companies=total, signals=signals,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /research/upload  (CSV file → scheduled / Make.com trigger)
+# ---------------------------------------------------------------------------
+@app.post("/research/upload", response_model=ResearchStartResponse, status_code=202)
+async def start_research_upload(
+    file: UploadFile = File(...),
+    provider: str = Form("openai"),
+    signals: str = Form(None),   # comma-separated signal keys, blank = all
+    run_via: str = Form("scheduled"),
+):
+    content = await file.read()
+    try:
+        text = content.decode("utf-8-sig")  # strip BOM if present
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="CSV must be UTF-8 encoded")
+
+    reader = csv.DictReader(io.StringIO(text))
+    companies = []
+    for row in reader:
+        # Accept several common column name variants
+        name = (
+            row.get("company_name") or row.get("Company Name") or
+            row.get("Company") or row.get("company") or ""
+        ).strip()
+        if not name:
+            continue
+        companies.append({
+            "company_name":        name,
+            "domain":              (row.get("domain") or row.get("Domain") or "").strip(),
+            "company_linkedin_url": (
+                row.get("company_linkedin_url") or
+                row.get("LinkedIn URL") or
+                row.get("linkedin_url") or ""
+            ).strip(),
+        })
+
+    if not companies:
+        raise HTTPException(status_code=400, detail="No valid companies found in CSV (need a 'company_name' column)")
+
+    signal_list = ALL_SIGNAL_KEYS
+    if signals and signals.strip():
+        signal_list = [s.strip() for s in signals.split(",") if s.strip() in ALL_SIGNAL_KEYS]
+        if not signal_list:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No valid signals. Valid: {ALL_SIGNAL_KEYS}",
+            )
+
+    provider = provider if provider in ("claude", "openai") else "openai"
+
+    job_id = str(uuid.uuid4())
+    total  = len(companies)
+
+    with store_lock:
+        job_store[job_id] = _make_research_job(total, signal_list, provider=provider, run_via=run_via)
+
+    request_data = {
+        "companies": companies,
+        "signals":   signal_list,
+        "provider":  provider,
+    }
+
+    threading.Thread(
+        target=run_research_pipeline,
+        args=(job_id, job_store, store_lock, request_data),
+        daemon=True,
+    ).start()
+
+    logger.info(f"Research upload job {job_id} — {total} companies, {len(signal_list)} signals, provider={provider}, run_via={run_via}.")
+    return ResearchStartResponse(
+        job_id=job_id, status="processing",
+        total_companies=total, signals=signal_list,
     )
 
 

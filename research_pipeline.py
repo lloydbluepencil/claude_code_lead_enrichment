@@ -4,6 +4,8 @@ Supports Claude (Anthropic) and GPT-4o (OpenAI) as LLM providers.
 Runs 7 configurable signals per company and returns Yes/No for each.
 """
 
+import csv
+import io
 import os
 import re
 import time
@@ -13,6 +15,7 @@ import logging
 from datetime import datetime, timedelta
 
 import anthropic
+import requests as _requests
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -24,6 +27,15 @@ _LLM_SEMAPHORE = threading.Semaphore(2)
 
 # Base delay between signals (seconds). Tune per API tier.
 _BASE_SIGNAL_DELAY = 30.0
+
+# Make.com webhook for job completion reports
+MAKE_WEBHOOK_URL = "https://hook.eu2.make.com/ynopubwvvpk3h6c5ftvjqqwdmh2igy99"
+
+# Token pricing per 1M tokens (USD)
+_PRICING = {
+    "claude": {"input": 3.00,  "output": 15.00},
+    "openai": {"input": 2.50,  "output": 10.00},
+}
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -151,8 +163,9 @@ def _parse_yes_no(text: str, provider: str) -> tuple[str, str]:
     return "Unknown", reasoning
 
 
-def _call_claude(prompt: str) -> str:
-    """Call Claude Sonnet with built-in web search."""
+def _call_claude(prompt: str) -> tuple[str, str, int, int]:
+    """Call Claude Sonnet with built-in web search.
+    Returns (answer, reasoning, input_tokens, output_tokens)."""
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
@@ -174,11 +187,15 @@ def _call_claude(prompt: str) -> str:
         for block in response.content
         if hasattr(block, "text") and block.text.strip()
     )
-    return _parse_yes_no(full_text, "claude")
+    answer, reasoning = _parse_yes_no(full_text, "claude")
+    input_tokens  = getattr(response.usage, "input_tokens",  0)
+    output_tokens = getattr(response.usage, "output_tokens", 0)
+    return answer, reasoning, input_tokens, output_tokens
 
 
-def _call_openai(prompt: str) -> tuple[str, str]:
-    """Call GPT-4o with built-in web search via the Responses API."""
+def _call_openai(prompt: str) -> tuple[str, str, int, int]:
+    """Call GPT-4o with built-in web search via the Responses API.
+    Returns (answer, reasoning, input_tokens, output_tokens)."""
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set")
@@ -191,14 +208,18 @@ def _call_openai(prompt: str) -> tuple[str, str]:
     )
 
     text = response.output_text or ""
-    return _parse_yes_no(text, "openai")
+    answer, reasoning = _parse_yes_no(text, "openai")
+    usage = getattr(response, "usage", None)
+    input_tokens  = getattr(usage, "input_tokens",  0) if usage else 0
+    output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+    return answer, reasoning, input_tokens, output_tokens
 
 
-def _call_model(prompt: str, provider: str) -> tuple[str, str]:
+def _call_model(prompt: str, provider: str) -> tuple[str, str, int, int]:
     """
     Route to the selected LLM provider.
     Wraps the call with exponential backoff + jitter on 429 errors.
-    Returns (answer, reasoning).
+    Returns (answer, reasoning, input_tokens, output_tokens).
     """
     max_retries = 4
     delay = _BASE_SIGNAL_DELAY
@@ -220,7 +241,7 @@ def _call_model(prompt: str, provider: str) -> tuple[str, str]:
                 else:
                     raise
 
-    return "Unknown", ""
+    return "Unknown", "", 0, 0
 
 
 # ---------------------------------------------------------------------------
@@ -256,22 +277,83 @@ def _research_company(
         logger.info(f"[{job_id}] {company_name} — [{provider}] researching: {signal}")
         try:
             prompt = _build_prompt(signal, company_name, website, linkedin_url)
-            answer, reasoning = _call_model(prompt, provider)
-            result[signal]                    = answer
-            result[f"{signal}_reasoning"]     = reasoning
+            answer, reasoning, in_tok, out_tok = _call_model(prompt, provider)
+            result[signal]                = answer
+            result[f"{signal}_reasoning"] = reasoning
             logger.info(f"[{job_id}] {company_name} — {signal}: {answer}")
         except Exception as exc:
             logger.error(f"[{job_id}] {company_name} — {signal} error: {exc}")
             result[signal]                = "Error"
             result[f"{signal}_reasoning"] = str(exc)
+            in_tok, out_tok = 0, 0
 
         with lock:
             job_store[job_id]["progress"]["signals_completed"] += 1
+            job_store[job_id]["token_usage"]["input_tokens"]  += in_tok
+            job_store[job_id]["token_usage"]["output_tokens"] += out_tok
 
         # Base delay + small jitter to smooth out token consumption
         time.sleep(_BASE_SIGNAL_DELAY + random.uniform(0, 5))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Make.com webhook helpers
+# ---------------------------------------------------------------------------
+
+def _build_csv(results: list, signals: list) -> str:
+    """Build CSV string from research results."""
+    signal_pairs = [f for s in signals for f in (s, f"{s}_reasoning")]
+    fields = ["date_today", "date_90_days_ago", "company_name", "domain", "company_linkedin_url"] + signal_pairs
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(results)
+    return out.getvalue()
+
+
+def _send_make_webhook(job_id: str, job: dict, signals: list):
+    """POST job completion report + CSV to Make.com webhook."""
+    started_at   = job.get("started_at")
+    completed_at = datetime.now()
+    elapsed_sec  = (completed_at - started_at).total_seconds() if started_at else 0
+    processing_time = f"{int(elapsed_sec // 60)}m {int(elapsed_sec % 60)}s"
+
+    provider = job.get("provider", "openai")
+    model    = "claude-sonnet-4-6" if provider == "claude" else "gpt-4o"
+
+    usage   = job.get("token_usage", {})
+    in_tok  = usage.get("input_tokens",  0)
+    out_tok = usage.get("output_tokens", 0)
+    pricing = _PRICING.get(provider, _PRICING["claude"])
+    cost    = (in_tok * pricing["input"] + out_tok * pricing["output"]) / 1_000_000
+
+    csv_content = _build_csv(job.get("results", []), signals)
+
+    metadata = {
+        "date_run":        completed_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "processing_time": processing_time,
+        "provider":        provider,
+        "model":           model,
+        "tokens_cost":     f"${cost:.4f}",
+        "input_tokens":    str(in_tok),
+        "output_tokens":   str(out_tok),
+        "total_companies": str(job["progress"]["companies_total"]),
+        "run_via":         job.get("run_via", "webapp"),
+        "job_id":          job_id,
+    }
+
+    try:
+        resp = _requests.post(
+            MAKE_WEBHOOK_URL,
+            files={"data": (f"research_{job_id}.csv", csv_content, "text/csv")},
+            data=metadata,
+            timeout=30,
+        )
+        logger.info(f"[{job_id}] Make.com webhook → {resp.status_code}")
+    except Exception as exc:
+        logger.error(f"[{job_id}] Make.com webhook failed: {exc}")
 
 
 def run_research_pipeline(
@@ -283,7 +365,7 @@ def run_research_pipeline(
     """Background thread — researches each company for all selected signals."""
     companies = request_data["companies"]
     signals   = request_data["signals"]
-    provider  = request_data.get("provider", "claude")
+    provider  = request_data.get("provider", "openai")
 
     for company in companies:
         try:
@@ -301,5 +383,7 @@ def run_research_pipeline(
 
     with lock:
         job_store[job_id]["status"] = "complete"
+        job_snapshot = dict(job_store[job_id])
 
     logger.info(f"[{job_id}] Research pipeline complete.")
+    _send_make_webhook(job_id, job_snapshot, signals)
