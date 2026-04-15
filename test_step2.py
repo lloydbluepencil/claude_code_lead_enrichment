@@ -67,8 +67,9 @@ def part_a_direct_search():
         "included_locations": ["104305776"],  # UAE id confirmed from Step 1
         "job_titles": FILTERS["job_titles"],
         "excluded_job_titles": FILTERS["excluded_job_titles"],
-        "seniority_levels": FILTERS["seniority_levels"],
+        "custom": {"seniority": FILTERS["seniority_levels"]},
         "webhook_url": f"{BASE_URL}/webhook/test-job-id",
+        "streaming": True,
         "limit": FILTERS["limit"],
     }
 

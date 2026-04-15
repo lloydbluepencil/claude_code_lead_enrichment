@@ -19,6 +19,12 @@ from models import (
     Contact,
 )
 from pipeline import run_pipeline, step3_enrich_person
+from research_pipeline import run_research_pipeline
+from models import (
+    ResearchRequest, ResearchStartResponse,
+    ResearchStatusResponse, ResearchProgress,
+    ALL_SIGNAL_KEYS,
+)
 
 load_dotenv()
 
@@ -267,3 +273,116 @@ async def webhook(job_id: str, request: Request):
         logger.warning(f"[{job_id}] Unrecognised webhook shape — ignoring")
 
     return {"received": True}
+
+
+# ===========================================================================
+# RESEARCH PIPELINE endpoints  /research/*
+# ===========================================================================
+
+def _make_research_job(total_companies: int, signals: list) -> dict:
+    return {
+        "type": "research",
+        "status": "processing",
+        "progress": {
+            "companies_processed": 0,
+            "companies_total": total_companies,
+            "signals_completed": 0,
+            "signals_total": total_companies * len(signals),
+        },
+        "results": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /research
+# ---------------------------------------------------------------------------
+@app.post("/research", response_model=ResearchStartResponse, status_code=202)
+def start_research(body: ResearchRequest):
+    if not body.companies:
+        raise HTTPException(status_code=400, detail="companies must not be empty")
+
+    signals = body.signals or ALL_SIGNAL_KEYS
+    invalid = [s for s in signals if s not in ALL_SIGNAL_KEYS]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown signal(s): {invalid}. Valid: {ALL_SIGNAL_KEYS}",
+        )
+
+    job_id = str(uuid.uuid4())
+    total  = len(body.companies)
+
+    with store_lock:
+        job_store[job_id] = _make_research_job(total, signals)
+
+    request_data = {
+        "companies": [c.model_dump() for c in body.companies],
+        "signals": signals,
+    }
+
+    threading.Thread(
+        target=run_research_pipeline,
+        args=(job_id, job_store, store_lock, request_data),
+        daemon=True,
+    ).start()
+
+    logger.info(f"Research job {job_id} started — {total} companies, {len(signals)} signals each.")
+    return ResearchStartResponse(
+        job_id=job_id, status="processing",
+        total_companies=total, signals=signals,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /research/{job_id}/status
+# ---------------------------------------------------------------------------
+@app.get("/research/{job_id}/status", response_model=ResearchStatusResponse)
+def get_research_status(job_id: str):
+    with store_lock:
+        job = job_store.get(job_id)
+
+    if job is None or job.get("type") != "research":
+        raise HTTPException(status_code=404, detail="Research job not found")
+
+    return ResearchStatusResponse(
+        job_id=job_id,
+        status=job["status"],
+        progress=ResearchProgress(**job["progress"]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /research/{job_id}/results  (?format=csv for download)
+# ---------------------------------------------------------------------------
+RESEARCH_CSV_FIELDS = ["company_name", "domain"] + ALL_SIGNAL_KEYS
+
+
+@app.get("/research/{job_id}/results")
+def get_research_results(job_id: str, format: str = "json"):
+    with store_lock:
+        job = job_store.get(job_id)
+
+    if job is None or job.get("type") != "research":
+        raise HTTPException(status_code=404, detail="Research job not found")
+
+    results = job["results"]
+    status  = job["status"]
+
+    if format.lower() == "csv":
+        if not results:
+            raise HTTPException(status_code=404, detail="No results yet")
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=RESEARCH_CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(results)
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=research_{job_id}.csv"},
+        )
+
+    if status != "complete" and not results:
+        return {"status": status}
+
+    return results
