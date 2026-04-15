@@ -12,6 +12,7 @@ import time
 import random
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import anthropic
@@ -22,11 +23,17 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_PROVIDERS = ("claude", "openai")
 
-# Max concurrent LLM calls across all jobs (prevents burst when multiple users run simultaneously)
-_LLM_SEMAPHORE = threading.Semaphore(2)
+# Max concurrent LLM calls across all jobs
+_LLM_SEMAPHORE = threading.Semaphore(5)
 
-# Base delay between signals (seconds). Tune per API tier.
-_BASE_SIGNAL_DELAY = 30.0
+# Delay between signals per provider (seconds)
+_SIGNAL_DELAYS = {
+    "claude": 30.0,   # Claude has stricter TPM limits
+    "openai": 5.0,    # GPT-4o handles much higher throughput
+}
+
+# Max companies processed in parallel
+_COMPANY_WORKERS = 5
 
 # Make.com webhook for job completion reports
 MAKE_WEBHOOK_URL = "https://hook.eu2.make.com/ynopubwvvpk3h6c5ftvjqqwdmh2igy99"
@@ -222,7 +229,7 @@ def _call_model(prompt: str, provider: str) -> tuple[str, str, int, int]:
     Returns (answer, reasoning, input_tokens, output_tokens).
     """
     max_retries = 4
-    delay = _BASE_SIGNAL_DELAY
+    delay = _SIGNAL_DELAYS.get(provider, 5.0)
 
     with _LLM_SEMAPHORE:
         for attempt in range(max_retries):
@@ -292,8 +299,9 @@ def _research_company(
             job_store[job_id]["token_usage"]["input_tokens"]  += in_tok
             job_store[job_id]["token_usage"]["output_tokens"] += out_tok
 
-        # Base delay + small jitter to smooth out token consumption
-        time.sleep(_BASE_SIGNAL_DELAY + random.uniform(0, 5))
+        # Delay between signals to stay within API rate limits
+        base_delay = _SIGNAL_DELAYS.get(provider, 5.0)
+        time.sleep(base_delay + random.uniform(0, base_delay * 0.15))
 
     return result
 
@@ -367,7 +375,7 @@ def run_research_pipeline(
     signals   = request_data["signals"]
     provider  = request_data.get("provider", "openai")
 
-    for company in companies:
+    def _process(company):
         try:
             result = _research_company(job_id, company, signals, provider, job_store, lock)
             with lock:
@@ -380,6 +388,11 @@ def run_research_pipeline(
             )
             with lock:
                 job_store[job_id]["progress"]["companies_processed"] += 1
+
+    with ThreadPoolExecutor(max_workers=_COMPANY_WORKERS) as pool:
+        futures = [pool.submit(_process, company) for company in companies]
+        for future in as_completed(futures):
+            future.result()  # surface any unhandled exceptions
 
     with lock:
         job_store[job_id]["status"] = "complete"
