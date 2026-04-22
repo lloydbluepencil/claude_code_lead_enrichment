@@ -62,11 +62,19 @@ def _cutoff() -> str:
 
 def _build_custom_prompt(template: str, company_name: str, domain: str, website: str, linkedin_url: str) -> str:
     """Substitute user-defined variables into a custom signal prompt template."""
-    return template.format(
+    filled = template.format(
         company_name=company_name,
         domain=domain,
         website=website,
         company_linkedin_url=linkedin_url,
+    )
+    return (
+        filled
+        + "\n\nOutput format:\n"
+        "1. Evidence summary: list each relevant source you found with its publication date, "
+        "the outlet or URL, and a one-sentence description of what was found. "
+        "If nothing qualifies, state that clearly.\n"
+        "2. Conclusion: end your response with a single line containing only \"Yes\" or \"No\"."
     )
 
 
@@ -81,7 +89,9 @@ Hard date gate (apply before deciding):
 - If the date is earlier than {cutoff}, discard it.
 - Do NOT treat "page updated/last modified", "recently", "this year", or similar as a valid date.
 
-Output only: Yes or No."""
+Output format:
+1. Evidence summary: list each relevant source you found with its publication date, the outlet or URL, and a one-sentence description of what was announced. If nothing qualifies, state that clearly.
+2. Conclusion: end your response with a single line containing only "Yes" or "No"."""
 
     SEARCH_SOURCES = f"""Search:
 - {website} (news / press releases / blog / IR)
