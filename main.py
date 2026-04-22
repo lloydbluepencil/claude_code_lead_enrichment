@@ -26,7 +26,7 @@ from research_pipeline import run_research_pipeline
 from models import (
     ResearchRequest, ResearchStartResponse,
     ResearchStatusResponse, ResearchProgress,
-    ALL_SIGNAL_KEYS, CustomSignal, SingleResearchRequest,
+    ALL_SIGNAL_KEYS, SIGNAL_DISPLAY_NAMES, CustomSignal, SingleResearchRequest,
 )
 
 load_dotenv()
@@ -496,12 +496,33 @@ def start_research_single(body: SingleResearchRequest):
     with store_lock:
         job = job_store[job_id]
 
-    results = job.get("results", [])
+    raw = job.get("results", [{}])[0] if job.get("results") else {}
+
+    # Build custom signal display name lookup
+    custom_display = {cs["key"]: cs.get("display_name", cs["key"]) for cs in custom_signals}
+
+    structured_results = []
+    for key in all_signals:
+        if key not in raw:
+            continue
+        title = SIGNAL_DISPLAY_NAMES.get(key) or custom_display.get(key) or key
+        structured_results.append({
+            key: {
+                "title":     title,
+                "result":    raw.get(key, "Unknown"),
+                "reasoning": raw.get(f"{key}_reasoning", ""),
+            }
+        })
+
     return {
-        "job_id":   job_id,
-        "status":   job.get("status", "complete"),
-        "provider": provider,
-        "results":  results,
+        "company_name":         raw.get("company_name", body.company_name),
+        "domain":               raw.get("domain", body.domain or ""),
+        "company_linkedin_url": raw.get("company_linkedin_url", body.company_linkedin_url or ""),
+        "date_today":           raw.get("date_today", ""),
+        "date_90_days_ago":     raw.get("date_90_days_ago", ""),
+        "job_id":               job_id,
+        "provider":             provider,
+        "results":              structured_results,
     }
 
 

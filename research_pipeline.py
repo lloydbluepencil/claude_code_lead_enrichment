@@ -190,7 +190,7 @@ def _call_claude(prompt: str) -> tuple[str, str, int, int]:
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=512,
+        max_tokens=2048,
         tools=[{
             "type": "web_search_20250305",
             "name": "web_search",
