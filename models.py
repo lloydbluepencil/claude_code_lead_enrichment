@@ -71,10 +71,26 @@ class ResearchCompany(BaseModel):
     company_linkedin_url: Optional[str] = None
 
 
+class CustomSignal(BaseModel):
+    key: str             # unique snake_case identifier, e.g. "ai_adoption"
+    display_name: str    # human-readable label shown in UI/CSV header
+    prompt_template: str # prompt text; supports {company_name}, {domain}, {website}, {company_linkedin_url}
+
+
 class ResearchRequest(BaseModel):
     companies: List[ResearchCompany]
-    signals: Optional[List[str]] = None   # None = run all signals
-    provider: Optional[str] = "openai"    # "claude" or "openai"
+    signals: Optional[List[str]] = None          # None = run all built-in signals
+    custom_signals: Optional[List[CustomSignal]] = []
+    provider: Optional[str] = "openai"           # "claude" or "openai"
+
+
+class SingleResearchRequest(BaseModel):
+    company_name: str
+    domain: Optional[str] = None
+    company_linkedin_url: Optional[str] = None
+    signals: Optional[List[str]] = None
+    custom_signals: Optional[List[CustomSignal]] = []
+    provider: Optional[str] = "openai"
 
 
 class ResearchStartResponse(BaseModel):
@@ -82,6 +98,7 @@ class ResearchStartResponse(BaseModel):
     status: str
     total_companies: int
     signals: List[str]
+    custom_signal_keys: Optional[List[str]] = []
 
 
 class ResearchProgress(BaseModel):

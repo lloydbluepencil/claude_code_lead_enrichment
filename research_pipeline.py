@@ -60,6 +60,16 @@ def _cutoff() -> str:
 # Signal prompt templates
 # ---------------------------------------------------------------------------
 
+def _build_custom_prompt(template: str, company_name: str, domain: str, website: str, linkedin_url: str) -> str:
+    """Substitute user-defined variables into a custom signal prompt template."""
+    return template.format(
+        company_name=company_name,
+        domain=domain,
+        website=website,
+        company_linkedin_url=linkedin_url,
+    )
+
+
 def _build_prompt(signal: str, company_name: str, website: str, linkedin_url: str) -> str:
     today  = _today()
     cutoff = _cutoff()
@@ -262,6 +272,7 @@ def _research_company(
     provider: str,
     job_store: dict,
     lock: threading.Lock,
+    custom_signals: list = None,  # list of CustomSignal dicts
 ) -> dict:
     company_name = company.get("company_name", "")
     domain       = company.get("domain", "")
@@ -273,25 +284,25 @@ def _research_company(
     )
 
     result: dict = {
-        "company_name":       company_name,
-        "domain":             domain,
+        "company_name":         company_name,
+        "domain":               domain,
         "company_linkedin_url": linkedin_url,
-        "date_today":         _today(),
-        "date_90_days_ago":   _cutoff(),
+        "date_today":           _today(),
+        "date_90_days_ago":     _cutoff(),
     }
 
-    for signal in signals:
-        logger.info(f"[{job_id}] {company_name} — [{provider}] researching: {signal}")
+    def _run_signal(signal_key: str, prompt: str):
+        nonlocal result
+        logger.info(f"[{job_id}] {company_name} — [{provider}] researching: {signal_key}")
         try:
-            prompt = _build_prompt(signal, company_name, website, linkedin_url)
             answer, reasoning, in_tok, out_tok = _call_model(prompt, provider)
-            result[signal]                = answer
-            result[f"{signal}_reasoning"] = reasoning
-            logger.info(f"[{job_id}] {company_name} — {signal}: {answer}")
+            result[signal_key]                = answer
+            result[f"{signal_key}_reasoning"] = reasoning
+            logger.info(f"[{job_id}] {company_name} — {signal_key}: {answer}")
         except Exception as exc:
-            logger.error(f"[{job_id}] {company_name} — {signal} error: {exc}")
-            result[signal]                = "Error"
-            result[f"{signal}_reasoning"] = str(exc)
+            logger.error(f"[{job_id}] {company_name} — {signal_key} error: {exc}")
+            result[signal_key]                = "Error"
+            result[f"{signal_key}_reasoning"] = str(exc)
             in_tok, out_tok = 0, 0
 
         with lock:
@@ -299,9 +310,25 @@ def _research_company(
             job_store[job_id]["token_usage"]["input_tokens"]  += in_tok
             job_store[job_id]["token_usage"]["output_tokens"] += out_tok
 
-        # Delay between signals to stay within API rate limits
         base_delay = _SIGNAL_DELAYS.get(provider, 5.0)
         time.sleep(base_delay + random.uniform(0, base_delay * 0.15))
+
+    # Built-in signals
+    for signal in signals:
+        _run_signal(signal, _build_prompt(signal, company_name, website, linkedin_url))
+
+    # Custom signals
+    for cs in (custom_signals or []):
+        key      = cs.get("key", "")
+        template = cs.get("prompt_template", "")
+        if not key or not template:
+            continue
+        try:
+            prompt = _build_custom_prompt(template, company_name, domain, website, linkedin_url)
+        except KeyError as exc:
+            prompt = template  # fall back to raw template if variable missing
+            logger.warning(f"[{job_id}] Custom signal {key!r} template variable missing: {exc}")
+        _run_signal(key, prompt)
 
     return result
 
@@ -321,8 +348,8 @@ def _build_csv(results: list, signals: list) -> str:
     return out.getvalue()
 
 
-def _send_make_webhook(job_id: str, job: dict, signals: list):
-    """POST job completion report + CSV to Make.com webhook."""
+def _send_make_webhook(job_id: str, job: dict, all_signals: list):
+    """POST completion report + full CSV to Make.com webhook."""
     started_at   = job.get("started_at")
     completed_at = datetime.now()
     elapsed_sec  = (completed_at - started_at).total_seconds() if started_at else 0
@@ -337,7 +364,7 @@ def _send_make_webhook(job_id: str, job: dict, signals: list):
     pricing = _PRICING.get(provider, _PRICING["claude"])
     cost    = (in_tok * pricing["input"] + out_tok * pricing["output"]) / 1_000_000
 
-    csv_content = _build_csv(job.get("results", []), signals)
+    csv_content = _build_csv(job.get("results", []), all_signals)
 
     metadata = {
         "date_run":        completed_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -350,6 +377,7 @@ def _send_make_webhook(job_id: str, job: dict, signals: list):
         "total_companies": str(job["progress"]["companies_total"]),
         "run_via":         job.get("run_via", "webapp"),
         "job_id":          job_id,
+        "status":          "complete",
     }
 
     try:
@@ -371,32 +399,31 @@ def run_research_pipeline(
     request_data: dict,
 ):
     """Background thread — researches each company for all selected signals."""
-    companies = request_data["companies"]
-    signals   = request_data["signals"]
-    provider  = request_data.get("provider", "openai")
+    companies      = request_data["companies"]
+    signals        = request_data["signals"]
+    provider       = request_data.get("provider", "openai")
+    custom_signals = request_data.get("custom_signals", [])
 
     def _process(company):
         try:
-            result = _research_company(job_id, company, signals, provider, job_store, lock)
+            result = _research_company(job_id, company, signals, provider, job_store, lock, custom_signals)
             with lock:
                 job_store[job_id]["results"].append(result)
                 job_store[job_id]["progress"]["companies_processed"] += 1
         except Exception as exc:
-            logger.error(
-                f"[{job_id}] Unhandled error researching "
-                f"{company.get('company_name')}: {exc}"
-            )
+            logger.error(f"[{job_id}] Unhandled error researching {company.get('company_name')}: {exc}")
             with lock:
                 job_store[job_id]["progress"]["companies_processed"] += 1
 
     with ThreadPoolExecutor(max_workers=_COMPANY_WORKERS) as pool:
         futures = [pool.submit(_process, company) for company in companies]
         for future in as_completed(futures):
-            future.result()  # surface any unhandled exceptions
+            future.result()
 
     with lock:
         job_store[job_id]["status"] = "complete"
         job_snapshot = dict(job_store[job_id])
 
+    all_signals = signals + [cs.get("key", "") for cs in custom_signals if cs.get("key")]
     logger.info(f"[{job_id}] Research pipeline complete.")
-    _send_make_webhook(job_id, job_snapshot, signals)
+    _send_make_webhook(job_id, job_snapshot, all_signals)
