@@ -455,9 +455,9 @@ def start_research(body: ResearchRequest):
 
 
 # ---------------------------------------------------------------------------
-# POST /research/single  (single company via JSON body)
+# POST /research/single  (single company — synchronous, waits for result)
 # ---------------------------------------------------------------------------
-@app.post("/research/single", response_model=ResearchStartResponse, status_code=202)
+@app.post("/research/single")
 def start_research_single(body: SingleResearchRequest):
     if not body.company_name:
         raise HTTPException(status_code=400, detail="company_name is required")
@@ -481,7 +481,7 @@ def start_research_single(body: SingleResearchRequest):
     }
 
     with store_lock:
-        job_store[job_id] = _make_research_job(1, all_signals, provider=provider, run_via="webapp")
+        job_store[job_id] = _make_research_job(1, all_signals, provider=provider, run_via="api")
 
     request_data = {
         "companies":      [company],
@@ -490,18 +490,19 @@ def start_research_single(body: SingleResearchRequest):
         "provider":       provider,
     }
 
-    threading.Thread(
-        target=run_research_pipeline,
-        args=(job_id, job_store, store_lock, request_data),
-        daemon=True,
-    ).start()
+    # Run synchronously in this thread — caller blocks until done
+    run_research_pipeline(job_id, job_store, store_lock, request_data)
 
-    logger.info(f"Single research job {job_id} — {body.company_name}, provider={provider}.")
-    return ResearchStartResponse(
-        job_id=job_id, status="processing",
-        total_companies=1, signals=signals,
-        custom_signal_keys=custom_keys,
-    )
+    with store_lock:
+        job = job_store[job_id]
+
+    results = job.get("results", [])
+    return {
+        "job_id":   job_id,
+        "status":   job.get("status", "complete"),
+        "provider": provider,
+        "results":  results,
+    }
 
 
 # ---------------------------------------------------------------------------
