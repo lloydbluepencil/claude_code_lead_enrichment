@@ -258,13 +258,21 @@ def _call_model(prompt: str, provider: str) -> tuple[str, str, int, int]:
                     return _call_openai(prompt)
                 return _call_claude(prompt)
             except Exception as exc:
-                is_rate_limit = "429" in str(exc) or "rate_limit" in str(exc).lower()
-                if is_rate_limit and attempt < max_retries - 1:
+                err_str = str(exc)
+                is_retryable = (
+                    "429" in err_str
+                    or "rate_limit" in err_str.lower()
+                    or "500" in err_str
+                    or "server_error" in err_str.lower()
+                    or "502" in err_str
+                    or "503" in err_str
+                )
+                if is_retryable and attempt < max_retries - 1:
                     jitter = random.uniform(0, delay * 0.25)
                     wait   = delay + jitter
-                    logger.warning(f"Rate limited (attempt {attempt + 1}/{max_retries}), retrying in {wait:.1f}s")
+                    logger.warning(f"Retryable error (attempt {attempt + 1}/{max_retries}), retrying in {wait:.1f}s — {exc}")
                     time.sleep(wait)
-                    delay *= 2  # exponential backoff
+                    delay *= 2
                 else:
                     raise
 

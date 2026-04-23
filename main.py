@@ -414,7 +414,8 @@ def start_research(body: ResearchRequest):
     if not body.companies:
         raise HTTPException(status_code=400, detail="companies must not be empty")
 
-    signals = body.signals or ALL_SIGNAL_KEYS
+    # None means "run all"; explicit empty list means "only custom signals"
+    signals = body.signals if body.signals is not None else ALL_SIGNAL_KEYS
     invalid = [s for s in signals if s not in ALL_SIGNAL_KEYS]
     if invalid:
         raise HTTPException(
@@ -425,6 +426,9 @@ def start_research(body: ResearchRequest):
     custom_signals = [cs.model_dump() for cs in (body.custom_signals or [])]
     custom_keys    = [cs["key"] for cs in custom_signals]
     all_signals    = signals + custom_keys
+
+    if not all_signals:
+        raise HTTPException(status_code=400, detail="At least one signal or custom signal is required")
 
     job_id   = str(uuid.uuid4())
     total    = len(body.companies)
@@ -462,7 +466,8 @@ def start_research_single(body: SingleResearchRequest):
     if not body.company_name:
         raise HTTPException(status_code=400, detail="company_name is required")
 
-    signals = body.signals or ALL_SIGNAL_KEYS
+    # None means "run all"; explicit empty list means "only custom signals"
+    signals = body.signals if body.signals is not None else ALL_SIGNAL_KEYS
     invalid = [s for s in signals if s not in ALL_SIGNAL_KEYS]
     if invalid:
         raise HTTPException(status_code=400, detail=f"Unknown signal(s): {invalid}. Valid: {ALL_SIGNAL_KEYS}")
@@ -470,6 +475,9 @@ def start_research_single(body: SingleResearchRequest):
     custom_signals = [cs.model_dump() for cs in (body.custom_signals or [])]
     custom_keys    = [cs["key"] for cs in custom_signals]
     all_signals    = signals + custom_keys
+
+    if not all_signals:
+        raise HTTPException(status_code=400, detail="At least one signal or custom signal is required")
 
     provider = body.provider if body.provider in ("claude", "openai") else "openai"
     job_id   = str(uuid.uuid4())
